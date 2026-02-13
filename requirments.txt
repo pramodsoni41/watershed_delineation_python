@@ -1,0 +1,6 @@
+numpy
+matplotlib
+pysheds
+rasterio
+pyproj
+scipy
