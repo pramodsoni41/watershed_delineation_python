@@ -25,25 +25,152 @@ import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib import colors
 from pyproj import CRS, Transformer
+# --- ADD THESE IMPORTS AT TOP (after existing imports) ---
+import geopandas as gpd
+from shapely.geometry import LineString, Polygon, MultiLineString, MultiPolygon
+from shapely.ops import unary_union
+import rasterio.features
 
+# --- ADD THESE USER SETTINGS (near USER SETTINGS) ---
+OUT_DIR = r"E:/QUALITY_1/outputs_pysheds"
+BASIN_SHP = f"{OUT_DIR}/basin_f4.shp"
+STREAMS_SHP = f"{OUT_DIR}/streams_f4.shp"
+
+# "Fine" streams: lower percentile => denser network (try 90–97)
+FINE_STREAM_PERCENTILE = 93
+
+# Optional: keep only streams inside basin in output shapefile
+CLIP_STREAMS_TO_BASIN = True
 # -----------------------------
 # USER SETTINGS
 # -----------------------------
 DEM_PATH = r"E:/QUALITY_1/Terrain/Terrain.ASTGTMV003_N26E083_dem.tif"
+def ensure_outdir(path):
+    import os
+    os.makedirs(path, exist_ok=True)
+import numpy as np
+from collections import deque
+
+# pysheds D8 convention: [N, NE, E, SE, S, SW, W, NW]
+# default dirmap often is: (64, 128, 1, 2, 4, 8, 16, 32)
+DIRS = [(-1, 0), (-1, 1), (0, 1), (1, 1), (1, 0), (1, -1), (0, -1), (-1, -1)]
+
+def strahler_order_d8(fdir, stream_mask, dirmap):
+    """
+    Compute Strahler stream order on a D8 stream network raster.
+    fdir: 2D array of flow directions (D8 codes)
+    stream_mask: 2D boolean array where True = stream cell
+    dirmap: tuple/list of 8 D8 codes in order [N,NE,E,SE,S,SW,W,NW]
+    returns: order raster (uint16), 0 where not stream
+    """
+    nrows, ncols = fdir.shape
+    stream = stream_mask.astype(bool)
+
+    # Maps direction code -> (dr, dc)
+    code2delta = {int(code): DIRS[i] for i, code in enumerate(dirmap)}
+
+    # We'll do a topological pass from upstream -> downstream using indegree (upstream count)
+    indeg = np.zeros_like(fdir, dtype=np.int32)      # number of upstream stream-neighbors
+    down_r = np.full_like(fdir, -1, dtype=np.int32)  # downstream row for each stream cell
+    down_c = np.full_like(fdir, -1, dtype=np.int32)  # downstream col for each stream cell
+
+    # Precompute downstream link and indegree
+    rr, cc = np.where(stream)
+    for r, c in zip(rr, cc):
+        code = int(fdir[r, c])
+        if code not in code2delta:
+            continue
+        dr, dc = code2delta[code]
+        r2, c2 = r + dr, c + dc
+        if 0 <= r2 < nrows and 0 <= c2 < ncols and stream[r2, c2]:
+            down_r[r, c] = r2
+            down_c[r, c] = c2
+            indeg[r2, c2] += 1
+
+    # Strahler DP state on each cell:
+    # max_up = maximum order among upstream tributaries seen so far
+    # nmax   = how many upstream tributaries achieved that max
+    max_up = np.zeros_like(fdir, dtype=np.uint16)
+    nmax   = np.zeros_like(fdir, dtype=np.uint16)
+    order  = np.zeros_like(fdir, dtype=np.uint16)
+
+    # Initialize queue with sources (no upstream stream-neighbors)
+    q = deque()
+    for r, c in zip(rr, cc):
+        if indeg[r, c] == 0:
+            order[r, c] = 1
+            q.append((r, c))
+
+    # Process upstream->downstream
+    while q:
+        r, c = q.popleft()
+        r2, c2 = down_r[r, c], down_c[r, c]
+        if r2 < 0:
+            continue  # outlet or leaving stream mask
+
+        o = order[r, c]
+
+        # update downstream DP state
+        if o > max_up[r2, c2]:
+            max_up[r2, c2] = o
+            nmax[r2, c2] = 1
+        elif o == max_up[r2, c2]:
+            nmax[r2, c2] += 1
+
+        # reduce indegree; when all upstream processed, finalize downstream order
+        indeg[r2, c2] -= 1
+        if indeg[r2, c2] == 0:
+            mo = max_up[r2, c2]
+            order[r2, c2] = mo + 1 if nmax[r2, c2] >= 2 else mo
+            q.append((r2, c2))
+
+    # non-stream cells remain 0
+    order[~stream] = 0
+    return order
+
+def mask_to_polygon(grid, mask_bool):
+    """
+    Convert a boolean Raster/array mask to a (multi)polygon in DEM CRS.
+    Uses rasterio.features.shapes with the grid affine transform.
+    """
+    mask_arr = np.asarray(mask_bool).astype(np.uint8)
+    transform = grid.affine  # affine transform for raster coords
+    shapes_gen = rasterio.features.shapes(mask_arr, mask=mask_arr.astype(bool), transform=transform)
+
+    polys = []
+    for geom, val in shapes_gen:
+        if val == 1:
+            polys.append(Polygon(geom["coordinates"][0]))
+
+    if not polys:
+        return None
+    return unary_union(polys)  # Polygon or MultiPolygon
+
+def branches_to_gdf(branches, crs_wkt):
+    """
+    Convert pysheds extract_river_network GeoJSON-like dict to GeoDataFrame of LineStrings.
+    """
+    lines = []
+    for feat in branches["features"]:
+        coords = feat["geometry"]["coordinates"]
+        if coords and len(coords) >= 2:
+            lines.append(LineString(coords))
+    gdf = gpd.GeoDataFrame({"id": range(1, len(lines) + 1)}, geometry=lines, crs=crs_wkt)
+    return gdf
 
 # Outlet input mode:
 #   "latlon"  -> use OUTLET_LAT/OUTLET_LON below
 #   "click"   -> click on accumulation plot; it prints lat/lon and uses that
 OUTLET_MODE = "latlon"   # "latlon" or "click"
 
-OUTLET_LAT = 26.275
-OUTLET_LON = 83.71
+OUTLET_LAT = 26.374909
+OUTLET_LON = 83.617662
 
 # Stream mask method:
 #   "percentile" -> uses STREAM_PERCENTILE of accumulation
 #   "area_km2"   -> uses STREAM_AREA_KM2 converted to cells (works best for projected CRS)
 STREAM_MASK_METHOD = "percentile"   # "percentile" or "area_km2"
-STREAM_PERCENTILE = 97              # 95 (more streams) ... 99 (fewer streams)
+STREAM_PERCENTILE = 98              # 95 (more streams) ... 99 (fewer streams)
 STREAM_AREA_KM2 = 20                # only used if STREAM_MASK_METHOD="area_km2"
 
 # Snap distance control (like TauDEM "snap threshold in meters")
@@ -151,15 +278,17 @@ dem = grid.read_raster(DEM_PATH).astype(float)
 dem_crs, to_ll, to_dem = get_transformers(grid)
 print("DEM CRS:", dem_crs)
 print("DEM bbox:", grid.bbox)
-
+dem2 = dem.astype(float)
+dem2[dem2 < 0] = np.nan
 # ---- Plot DEM (pretty) ----
 fig, ax = plt.subplots(figsize=FIGSIZE)
-im = ax.imshow(dem, extent=grid.extent, cmap="terrain", interpolation=INTERP)
+im = ax.imshow(dem2, extent=grid.extent, cmap="terrain", interpolation=INTERP)
 plt.colorbar(im, ax=ax, label="Elevation (m)")
 pretty_axes(ax, "Digital Elevation Model")
 set_latlon_ticks(ax, grid)
 plt.tight_layout()
 plt.show()
+plt.savefig(f"{OUT_DIR}/DEM.png", dpi=150)
 
 # ---- Hydrologic conditioning ----
 pit_filled = grid.fill_pits(dem)
@@ -178,6 +307,7 @@ pretty_axes(ax, "Flow Direction Grid")
 set_latlon_ticks(ax, grid)
 plt.tight_layout()
 plt.show()
+plt.savefig(f"{OUT_DIR}/FDIR.png", dpi=150)
 
 # ---- Accumulation ----
 acc = grid.accumulation(fdir, dirmap=dirmap)
@@ -199,7 +329,8 @@ pretty_axes(ax, "Flow Accumulation")
 set_latlon_ticks(ax, grid)
 plt.tight_layout()
 plt.show()
-
+plt.savefig(f"{OUT_DIR}/FACC.png", dpi=150)
+#%%
 # ---- Outlet selection (lat/lon input OR click) ----
 if OUTLET_MODE.lower() == "click":
     print("Click ONE point on the Accumulation map window, then press Enter...")
@@ -220,7 +351,7 @@ inside = (grid.bbox[0] <= x0 <= grid.bbox[2]) and (grid.bbox[1] <= y0 <= grid.bb
 print("Outlet inside DEM bbox:", inside)
 if not inside:
     raise ValueError("Outlet is outside DEM extent. Use a larger DEM tile or correct coordinates.")
-
+#%%
 # ---- Stream mask + snapping ----
 stream_mask, thr_used, thr_note = build_stream_mask(
     grid, acc,
@@ -272,3 +403,226 @@ set_latlon_ticks(ax, grid)
 ax.legend(loc="lower left", frameon=True)
 plt.tight_layout()
 plt.show()
+#%%
+
+# 1) Create a finer stream mask for denser network
+fine_stream_mask, fine_thr_used, fine_thr_note = build_stream_mask(
+    grid, acc,
+    method="percentile",
+    percentile=FINE_STREAM_PERCENTILE,
+    area_km2=STREAM_AREA_KM2
+)
+print("Fine stream mask:", fine_thr_note)
+# 2) Extract finer river network
+fine_branches = grid.extract_river_network(fdir, fine_stream_mask, dirmap=dirmap)
+# 3) Convert basin raster to polygon and save as SHP
+basin_poly = mask_to_polygon(grid, catch_view)
+
+if basin_poly is None:
+    raise ValueError("Basin polygon conversion failed (empty basin mask).")
+
+basin_gdf = gpd.GeoDataFrame({"name": ["Basin_1"]}, geometry=[basin_poly], crs=str(grid.crs))
+basin_gdf.to_file(BASIN_SHP)
+print("✅ Basin shapefile saved:", BASIN_SHP)
+
+
+# 4) Convert streams to GeoDataFrame and (optionally) clip to basin
+streams_gdf = branches_to_gdf(fine_branches, crs_wkt=str(grid.crs))
+# add a representative accumulation value to each line by sampling points along it
+import numpy as np
+strahler = strahler_order_d8(fdir, fine_stream_mask, dirmap)
+
+def densify_xy(geom, n=25):
+    if geom is None or geom.is_empty:
+        return []
+    if geom.geom_type == "MultiLineString":
+        geom = max(list(geom.geoms), key=lambda g: g.length)
+    if geom.length == 0:
+        x, y = list(geom.coords)[0]
+        return [(x, y)]
+    pts = [geom.interpolate(t, normalized=True) for t in np.linspace(0, 1, n)]
+    return [(p.x, p.y) for p in pts]
+
+# def sample_order_max(line_geom, grid, order_raster, n=25):
+#     pts = densify_xy(line_geom, n=n)
+#     nrows, ncols = order_raster.shape
+#     best = 0
+
+#     for x, y in pts:
+#         # nearest cell
+#         try:
+#             r, c = grid.nearest_cell(x, y)
+#         except TypeError:
+#             r, c = grid.nearest_cell((x, y))
+
+#         # ✅ skip if outside raster
+#         if r < 0 or c < 0 or r >= nrows or c >= ncols:
+#             continue
+
+#         v = int(order_raster[r, c])
+#         if v > best:
+#             best = v
+
+#     return best
+def sample_order_max(line_geom, grid, order_raster, n=25):
+    pts = densify_xy(line_geom, n=n)
+    nrows, ncols = order_raster.shape
+    best = 0
+
+    for x, y in pts:
+        try:
+            r, c = grid.nearest_cell(x, y)
+        except TypeError:
+            r, c = grid.nearest_cell((x, y))
+
+        r = int(np.clip(r, 0, nrows - 1))
+        c = int(np.clip(c, 0, ncols - 1))
+
+        v = int(order_raster[r, c])
+        if v > best:
+            best = v
+
+    return best
+
+
+
+
+if CLIP_STREAMS_TO_BASIN:
+    # Ensure CRS matches
+    streams_gdf = streams_gdf.to_crs(basin_gdf.crs)
+    
+    # Clip
+    streams_gdf = gpd.clip(streams_gdf, basin_gdf)
+    
+    # Clean geometry
+    streams_gdf = streams_gdf[~streams_gdf.is_empty]
+    streams_gdf.reset_index(drop=True, inplace=True)
+    
+streams_gdf = streams_gdf.copy()
+streams_gdf["order"] = [sample_order_max(g, grid, strahler, n=25) for g in streams_gdf.geometry]
+
+print(streams_gdf["order"].value_counts().sort_index())
+streams_gdf.to_file(STREAMS_SHP)
+print("✅ Streams shapefile saved:", STREAMS_SHP)
+
+
+#%% STREAM PLOT
+# --- choose a cutoff to declutter (try 3 or 4) ---
+MIN_PLOT_ORDER = 5
+
+from shapely.geometry import LineString, MultiLineString
+from matplotlib.collections import LineCollection
+import numpy as np
+import matplotlib.pyplot as plt
+
+s = streams_gdf[streams_gdf["order"] >= MIN_PLOT_ORDER].copy()
+
+if s.empty:
+    print("No streams above MIN_PLOT_ORDER. Lower MIN_PLOT_ORDER.")
+else:
+    orders_unique = sorted(s["order"].unique())
+    min_o = min(orders_unique)
+    max_o = max(orders_unique)
+
+    # Use a categorical colormap (distinct colors)
+    cmap = plt.cm.get_cmap("tab10", len(orders_unique))
+
+    def geom_to_segments(geom):
+        if geom is None or geom.is_empty:
+            return []
+        if geom.geom_type == "LineString":
+            return [np.asarray(geom.coords)]
+        if geom.geom_type == "MultiLineString":
+            return [np.asarray(g.coords) for g in geom.geoms if not g.is_empty]
+        return []
+
+    legend_handles = []
+
+    for idx, order in enumerate(orders_unique):
+
+        sub = s[s["order"] == order]
+
+        segs = []
+        for geom in sub.geometry:
+            parts = geom_to_segments(geom)
+            for arr in parts:
+                if arr.shape[0] >= 2:
+                    segs.append(arr)
+
+        if not segs:
+            continue
+
+        # Width increases with order
+        width = 1.2 + 1.2 * (order - min_o)
+
+        # Distinct color per order
+        color = cmap(idx)
+
+        lc = LineCollection(
+            segs,
+            linewidths=width,
+            colors=[color] * len(segs),
+            capstyle="round",
+            joinstyle="round",
+            zorder=5
+        )
+
+        ax.add_collection(lc)
+
+        # Add legend entry
+        legend_handles.append(
+            Line2D([0], [0], color=color, lw=width, label=f"Order {order}")
+        )
+
+# Outlets
+ax.plot(x0, y0, "r*", ms=12, zorder=10, label="Original outlet")
+ax.plot(x_snap, y_snap, "ko", ms=6, zorder=10, label="Snapped outlet")
+
+pretty_axes(ax, "Basin + Stream Network (Strahler order)")
+set_latlon_ticks(ax, grid)
+
+# Legend
+handles, labels = ax.get_legend_handles_labels()
+ax.legend(
+    legend_handles + handles,
+    [h.get_label() for h in legend_handles] + labels,
+    loc="lower left",
+    frameon=True,
+    fontsize=9
+)
+
+plt.tight_layout()
+plt.savefig(f"{OUT_DIR}/BASIN_DEL.png", dpi=300, bbox_inches="tight")
+plt.show()
+
+
+
+#%%
+import geopandas as gpd
+from shapely.geometry import Point
+import os
+
+os.makedirs(OUT_DIR, exist_ok=True)
+
+# Create shapely point (in DEM CRS)
+outlet_point = Point(x_snap, y_snap)
+
+
+orig_point = Point(x0, y0)
+
+outlet_gdf = gpd.GeoDataFrame(
+    {
+        "type": ["original", "snapped"],
+        "lat": [OUTLET_LAT, lat_snap],
+        "lon": [OUTLET_LON, lon_snap]
+    },
+    geometry=[orig_point, outlet_point],
+    crs=str(grid.crs)
+)
+
+
+OUTLET_SHP = f"{OUT_DIR}/outlet_point.shp"
+outlet_gdf.to_file(OUTLET_SHP)
+
+outlet_gdf_ll = outlet_gdf.to_crs("EPSG:4326")
+outlet_gdf_ll.to_file(f"{OUT_DIR}/outlet_point_wgs84.shp")
