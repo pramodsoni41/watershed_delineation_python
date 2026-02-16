@@ -34,7 +34,7 @@ warnings.filterwarnings("ignore")
 # USER INPUTS
 # -------------------------
 BASIN_SHP   = r"E:/QUALITY_1/outputs_pysheds/basin.shp"
-STREAMS_SHP = r"E:/QUALITY_1/outputs_pysheds/streams_f4.shp"
+STREAMS_SHP = r"E:/QUALITY_1/outputs_pysheds/streams_f7.shp"
 
 # DEM is REQUIRED for relief metrics (Zmax, Zmin, etc.)
 DEM_TIF     = r"E:/QUALITY_1/Terrain/Terrain.ASTGTMV003_N26E083_dem.tif"  # set None to skip relief
