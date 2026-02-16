@@ -19,6 +19,60 @@ What this script does:
 6) Delineates catchment
 7) Produces "beautiful" maps: DEM, flowdir, accumulation, catchment+streams
 """
+# --- ADD THESE IMPORTS AT TOP (after existing imports) ---
+import geopandas as gpd
+from shapely.geometry import LineString, Polygon, MultiLineString, MultiPolygon
+from shapely.ops import unary_union
+import rasterio.features
+
+# --- ADD THESE USER SETTINGS (near USER SETTINGS) ---
+OUT_DIR = r"E:/QUALITY_1/outputs_pysheds"
+BASIN_SHP = f"{OUT_DIR}/basin.shp"
+STREAMS_SHP = f"{OUT_DIR}/streams.shp"
+
+# "Fine" streams: lower percentile => denser network (try 90–97)
+FINE_STREAM_PERCENTILE = 93
+
+# Optional: keep only streams inside basin in output shapefile
+CLIP_STREAMS_TO_BASIN = True
+
+
+# =========================================================
+# ========= ADD THESE HELPERS BELOW YOUR HELPERS ===========
+# =========================================================
+def ensure_outdir(path):
+    import os
+    os.makedirs(path, exist_ok=True)
+
+def mask_to_polygon(grid, mask_bool):
+    """
+    Convert a boolean Raster/array mask to a (multi)polygon in DEM CRS.
+    Uses rasterio.features.shapes with the grid affine transform.
+    """
+    mask_arr = np.asarray(mask_bool).astype(np.uint8)
+    transform = grid.affine  # affine transform for raster coords
+    shapes_gen = rasterio.features.shapes(mask_arr, mask=mask_arr.astype(bool), transform=transform)
+
+    polys = []
+    for geom, val in shapes_gen:
+        if val == 1:
+            polys.append(Polygon(geom["coordinates"][0]))
+
+    if not polys:
+        return None
+    return unary_union(polys)  # Polygon or MultiPolygon
+
+def branches_to_gdf(branches, crs_wkt):
+    """
+    Convert pysheds extract_river_network GeoJSON-like dict to GeoDataFrame of LineStrings.
+    """
+    lines = []
+    for feat in branches["features"]:
+        coords = feat["geometry"]["coordinates"]
+        if coords and len(coords) >= 2:
+            lines.append(LineString(coords))
+    gdf = gpd.GeoDataFrame({"id": range(1, len(lines) + 1)}, geometry=lines, crs=crs_wkt)
+    return gdf
 
 from pysheds.grid import Grid
 import numpy as np
@@ -243,6 +297,70 @@ catch_arr = np.asarray(catch_view)
 
 # Extract rivers (vector)
 branches = grid.extract_river_network(fdir, stream_mask, dirmap=dirmap)
+
+ensure_outdir(OUT_DIR)
+
+# 1) Create a finer stream mask for denser network
+fine_stream_mask, fine_thr_used, fine_thr_note = build_stream_mask(
+    grid, acc,
+    method="percentile",
+    percentile=FINE_STREAM_PERCENTILE,
+    area_km2=STREAM_AREA_KM2
+)
+print("Fine stream mask:", fine_thr_note)
+
+# 2) Extract finer river network
+fine_branches = grid.extract_river_network(fdir, fine_stream_mask, dirmap=dirmap)
+
+# 3) Convert basin raster to polygon and save as SHP
+basin_poly = mask_to_polygon(grid, catch_view)
+
+if basin_poly is None:
+    raise ValueError("Basin polygon conversion failed (empty basin mask).")
+
+basin_gdf = gpd.GeoDataFrame({"name": ["Basin_1"]}, geometry=[basin_poly], crs=str(grid.crs))
+basin_gdf.to_file(BASIN_SHP)
+print("✅ Basin shapefile saved:", BASIN_SHP)
+
+# 4) Convert streams to GeoDataFrame and (optionally) clip to basin
+streams_gdf = branches_to_gdf(fine_branches, crs_wkt=str(grid.crs))
+
+if CLIP_STREAMS_TO_BASIN:
+    streams_gdf = gpd.overlay(streams_gdf, basin_gdf, how="intersection")
+
+streams_gdf.to_file(STREAMS_SHP)
+print("✅ Streams shapefile saved:", STREAMS_SHP)
+
+
+# =========================================================
+# ========= OPTIONAL: BEAUTIFUL PLOT OF FINE NETWORK =======
+# =========================================================
+fig, ax = plt.subplots(figsize=(10, 8))
+
+# hillshade-like background
+gy, gx = np.gradient(np.nan_to_num(inflated, nan=np.nanmean(inflated)))
+slope = np.hypot(gx, gy)
+shade = 1 - (slope / (np.nanmax(slope) if np.nanmax(slope) > 0 else 1))
+ax.imshow(shade, extent=grid.extent, cmap="gray", alpha=0.85, interpolation=INTERP)
+
+# basin outline + fill
+basin_gdf.boundary.plot(ax=ax, linewidth=2)
+basin_gdf.plot(ax=ax, alpha=0.15)
+
+# fine streams
+streams_gdf.plot(ax=ax, linewidth=1.0)
+
+# outlet points
+ax.plot(x0, y0, "r*", ms=12, label=f"Original ({OUTLET_LAT:.4f}, {OUTLET_LON:.4f})")
+ax.plot(x_snap, y_snap, "ko", ms=6, label=f"Snapped ({lat_snap:.4f}, {lon_snap:.4f})")
+
+pretty_axes(ax, "Basin + Fine Stream Network (Shapefile Exported)")
+set_latlon_ticks(ax, grid)
+ax.legend(loc="lower left", frameon=True)
+
+plt.tight_layout()
+plt.show()
+
 
 # ---- Beautiful final plot: Catchment + Streams + Outlet ----
 fig, ax = plt.subplots(figsize=(10, 8))
