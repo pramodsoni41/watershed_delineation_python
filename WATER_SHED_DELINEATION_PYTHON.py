@@ -428,9 +428,28 @@ print("✅ Basin shapefile saved:", BASIN_SHP)
 
 # 4) Convert streams to GeoDataFrame and (optionally) clip to basin
 streams_gdf = branches_to_gdf(fine_branches, crs_wkt=str(grid.crs))
+
+
+
 # add a representative accumulation value to each line by sampling points along it
 import numpy as np
 strahler = strahler_order_d8(fdir, fine_stream_mask, dirmap)
+
+streams_list = []
+
+for k in range(1, int(strahler.max()) + 1):
+    mask_k = (strahler == k)
+    if mask_k.sum() == 0:
+        continue
+
+    branches_k = grid.extract_river_network(fdir, mask_k, dirmap=dirmap)
+    gdf_k = branches_to_gdf(branches_k, crs_wkt=str(grid.crs))
+    gdf_k["order"] = k
+    streams_list.append(gdf_k)
+
+streams_gdf = gpd.GeoDataFrame(pd.concat(streams_list, ignore_index=True), crs=str(grid.crs))
+
+print("Unique Strahler:", np.unique(strahler[strahler > 0]))
 
 def densify_xy(geom, n=25):
     if geom is None or geom.is_empty:
@@ -443,27 +462,7 @@ def densify_xy(geom, n=25):
     pts = [geom.interpolate(t, normalized=True) for t in np.linspace(0, 1, n)]
     return [(p.x, p.y) for p in pts]
 
-# def sample_order_max(line_geom, grid, order_raster, n=25):
-#     pts = densify_xy(line_geom, n=n)
-#     nrows, ncols = order_raster.shape
-#     best = 0
 
-#     for x, y in pts:
-#         # nearest cell
-#         try:
-#             r, c = grid.nearest_cell(x, y)
-#         except TypeError:
-#             r, c = grid.nearest_cell((x, y))
-
-#         # ✅ skip if outside raster
-#         if r < 0 or c < 0 or r >= nrows or c >= ncols:
-#             continue
-
-#         v = int(order_raster[r, c])
-#         if v > best:
-#             best = v
-
-#     return best
 def sample_order_max(line_geom, grid, order_raster, n=25):
     pts = densify_xy(line_geom, n=n)
     nrows, ncols = order_raster.shape
@@ -506,57 +505,101 @@ streams_gdf.to_file(STREAMS_SHP)
 print("✅ Streams shapefile saved:", STREAMS_SHP)
 
 
-#%% STREAM PLOT
-# --- choose a cutoff to declutter (try 3 or 4) ---
-MIN_PLOT_ORDER = 5
 
-from shapely.geometry import LineString, MultiLineString
-from matplotlib.collections import LineCollection
+#%%
 import numpy as np
 import matplotlib.pyplot as plt
+from matplotlib.collections import LineCollection
+from matplotlib.lines import Line2D
 
-s = streams_gdf[streams_gdf["order"] >= MIN_PLOT_ORDER].copy()
+def plot_basin_streams_pretty(
+    ax,
+    basin_gdf,
+    streams_gdf,
+    grid,
+    inflated,
+    INTERP,
+    x0=None, y0=None, x_snap=None, y_snap=None,
+    min_plot_order=4,
+    title="Basin + Stream Network (Strahler order)",
+    pad_frac=0.08,
+    hillshade_alpha=0.55,
+    basin_fill_alpha=0.18,
+    basin_fill_color="lightblue",
+    basin_edge_color="black",
+    basin_edge_lw=2.2,
+    cmap_name="tab10",      # distinct colors
+    simplify_tol=None       # e.g., 5 or 10 (meters) to speed up
+):
+    # ---- Center/zoom to basin ----
+    basin1 = basin_gdf.dissolve().geometry.iloc[0]
+    minx, miny, maxx, maxy = basin1.bounds
+    dx, dy = (maxx - minx), (maxy - miny)
+    ax.set_xlim(minx - dx*pad_frac, maxx + dx*pad_frac)
+    ax.set_ylim(miny - dy*pad_frac, maxy + dy*pad_frac)
 
-if s.empty:
-    print("No streams above MIN_PLOT_ORDER. Lower MIN_PLOT_ORDER.")
-else:
-    orders_unique = sorted(s["order"].unique())
-    min_o = min(orders_unique)
-    max_o = max(orders_unique)
+    # ---- Hillshade ----
+    gy, gx = np.gradient(np.nan_to_num(inflated, nan=np.nanmean(inflated)))
+    slope = np.hypot(gx, gy)
+    shade = 1 - (slope / (np.nanmax(slope) if np.nanmax(slope) > 0 else 1))
+    ax.imshow(shade, extent=grid.extent, cmap="gray",
+              alpha=hillshade_alpha, interpolation=INTERP, zorder=0)
 
-    # Use a categorical colormap (distinct colors)
-    cmap = plt.cm.get_cmap("tab10", len(orders_unique))
+    # ---- Basin ----
+    basin_gdf.plot(ax=ax, alpha=basin_fill_alpha, color=basin_fill_color, zorder=2)
+    basin_gdf.boundary.plot(ax=ax, linewidth=basin_edge_lw, color=basin_edge_color, zorder=8)
+
+    # ---- Streams (filter + optional simplify) ----
+    s = streams_gdf.copy()
+    s = s[s["order"] >= min_plot_order].copy()
+
+    # Fast bbox prefilter before drawing
+    s = s.cx[minx:maxx, miny:maxy].copy()
+
+    if simplify_tol is not None:
+        s["geometry"] = s.geometry.simplify(simplify_tol, preserve_topology=True)
+
+    if s.empty:
+        ax.set_title(f"{title}\n(No streams with order ≥ {min_plot_order})")
+        return
+
+    orders = sorted(s["order"].unique())
+    cmap = plt.cm.get_cmap(cmap_name, len(orders))
 
     def geom_to_segments(geom):
         if geom is None or geom.is_empty:
             return []
-        if geom.geom_type == "LineString":
-            return [np.asarray(geom.coords)]
-        if geom.geom_type == "MultiLineString":
-            return [np.asarray(g.coords) for g in geom.geoms if not g.is_empty]
+        gt = geom.geom_type
+        if gt == "LineString":
+            arr = np.asarray(geom.coords)
+            return [arr] if arr.shape[0] >= 2 else []
+        if gt == "MultiLineString":
+            out = []
+            for g in geom.geoms:
+                if g is None or g.is_empty:
+                    continue
+                arr = np.asarray(g.coords)
+                if arr.shape[0] >= 2:
+                    out.append(arr)
+            return out
         return []
 
     legend_handles = []
 
-    for idx, order in enumerate(orders_unique):
-
-        sub = s[s["order"] == order]
+    # Draw low orders first, high orders last (on top)
+    for i, o in enumerate(orders):
+        sub = s[s["order"] == o]
 
         segs = []
         for geom in sub.geometry:
-            parts = geom_to_segments(geom)
-            for arr in parts:
-                if arr.shape[0] >= 2:
-                    segs.append(arr)
+            segs.extend(geom_to_segments(geom))
 
         if not segs:
             continue
 
-        # Width increases with order
-        width = 1.2 + 1.2 * (order - min_o)
-
-        # Distinct color per order
-        color = cmap(idx)
+        # thickness scaling (higher order thicker)
+        width = 0.9 + 0.9 * (o - orders[0])  # tweak if you want more/less contrast
+        color = cmap(i)
 
         lc = LineCollection(
             segs,
@@ -564,37 +607,55 @@ else:
             colors=[color] * len(segs),
             capstyle="round",
             joinstyle="round",
-            zorder=5
+            zorder=5 + (o - orders[0])
         )
-
         ax.add_collection(lc)
 
-        # Add legend entry
-        legend_handles.append(
-            Line2D([0], [0], color=color, lw=width, label=f"Order {order}")
-        )
+        legend_handles.append(Line2D([0], [0], color=color, lw=width, label=f"Order {o}"))
 
-# Outlets
-ax.plot(x0, y0, "r*", ms=12, zorder=10, label="Original outlet")
-ax.plot(x_snap, y_snap, "ko", ms=6, zorder=10, label="Snapped outlet")
+    # ---- Outlets ----
+    if x0 is not None and y0 is not None:
+        ax.plot(x0, y0, "r*", ms=12, zorder=10, label="Original outlet")
+    if x_snap is not None and y_snap is not None:
+        ax.plot(x_snap, y_snap, "ko", ms=6, zorder=10, label="Snapped outlet")
 
-pretty_axes(ax, "Basin + Stream Network (Strahler order)")
-set_latlon_ticks(ax, grid)
+    # ---- Cosmetics ----
+    try:
+        pretty_axes(ax, title)
+        set_latlon_ticks(ax, grid)
+    except Exception:
+        ax.set_title(title)
 
-# Legend
-handles, labels = ax.get_legend_handles_labels()
-ax.legend(
-    legend_handles + handles,
-    [h.get_label() for h in legend_handles] + labels,
-    loc="lower left",
-    frameon=True,
-    fontsize=9
+    # Legend: orders first, then outlets
+    h2, l2 = ax.get_legend_handles_labels()
+    ax.legend(
+        legend_handles + h2,
+        [h.get_label() for h in legend_handles] + l2,
+        loc="lower left",
+        frameon=True,
+        fontsize=9
+    )
+
+# ----------------- USE IT -----------------
+fig, ax = plt.subplots(figsize=(10, 8))
+
+plot_basin_streams_pretty(
+    ax=ax,
+    basin_gdf=basin_gdf,
+    streams_gdf=streams_gdf,   # must have "order"
+    grid=grid,
+    inflated=inflated,
+    INTERP=INTERP,
+    x0=x0, y0=y0, x_snap=x_snap, y_snap=y_snap,
+    min_plot_order=4,          # try 5 for very clean map
+    title="Basin + Stream Network (Strahler order)",
+    cmap_name="tab10",         # distinct colors; try "Set2" or "viridis"
+    simplify_tol=10            # meters (UTM). Set None to disable.
 )
 
 plt.tight_layout()
-plt.savefig(f"{OUT_DIR}/BASIN_DEL.png", dpi=300, bbox_inches="tight")
+plt.savefig(f"{OUT_DIR}/BASIN_DEL_ORDERED.png", dpi=300, bbox_inches="tight")
 plt.show()
-
 
 
 #%%
