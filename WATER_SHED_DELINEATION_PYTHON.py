@@ -1,222 +1,274 @@
-# ==============================================
-# WATERSHED DELINEATION USING PYSHEDS
-# Dr. Pramod Soni
-# ==============================================
+# -*- coding: utf-8 -*-
+"""
+Created on Mon Feb 16 11:24:21 2026
 
-from pathlib import Path
+@author: acer
+"""
+
+# -*- coding: utf-8 -*-
+"""
+Watershed delineation with PySheds (Lat/Lon input + clean plots)
+Dr. Pramod Soni (modified)
+
+What this script does:
+1) Reads DEM
+2) Hydrologic conditioning: fill pits -> fill depressions -> resolve flats
+3) Flow direction + accumulation
+4) Takes outlet as Lat/Lon (WGS84) OR click point and prints Lat/Lon
+5) Snaps outlet to stream mask (percentile or area threshold)
+6) Delineates catchment
+7) Produces "beautiful" maps: DEM, flowdir, accumulation, catchment+streams
+"""
+
+from pysheds.grid import Grid
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib import colors
-from pysheds.grid import Grid
-
-# Optional but recommended (for CRS transform)
 from pyproj import CRS, Transformer
 
+# -----------------------------
+# USER SETTINGS
+# -----------------------------
+DEM_PATH = r"E:/QUALITY_1/Terrain/Terrain.ASTGTMV003_N26E083_dem.tif"
 
-# =====================================================
-# ========= USER INPUT SECTION (EDIT HERE) ============
-# =====================================================
+# Outlet input mode:
+#   "latlon"  -> use OUTLET_LAT/OUTLET_LON below
+#   "click"   -> click on accumulation plot; it prints lat/lon and uses that
+OUTLET_MODE = "latlon"   # "latlon" or "click"
 
-DEM_PATH = Path("data/dem.tif")          # Path to DEM file
-OUTPUT_FOLDER = Path("outputs")          # Output directory
+OUTLET_LAT = 26.275
+OUTLET_LON = 83.71
 
-# --- Pour point ---
-# If your coordinates are Lat/Lon (WGS84), set mode="latlon"
-# If your coordinates are already in DEM projected CRS, set mode="projected"
-POUR_POINT_MODE = "latlon"               # "latlon" OR "projected"
+# Stream mask method:
+#   "percentile" -> uses STREAM_PERCENTILE of accumulation
+#   "area_km2"   -> uses STREAM_AREA_KM2 converted to cells (works best for projected CRS)
+STREAM_MASK_METHOD = "percentile"   # "percentile" or "area_km2"
+STREAM_PERCENTILE = 97              # 95 (more streams) ... 99 (fewer streams)
+STREAM_AREA_KM2 = 20                # only used if STREAM_MASK_METHOD="area_km2"
 
-POUR_LAT = 25.2                         # used if mode="latlon"
-POUR_LON = 82.9                         # used if mode="latlon"
+# Snap distance control (like TauDEM "snap threshold in meters")
+MAX_SNAP_DISTANCE_M = 3000  # for EPSG:4326 this will be treated approximately (see note)
 
-POUR_X = 326500                          # used if mode="projected"
-POUR_Y = 1289000                         # used if mode="projected"
+# Plot tuning
+FIGSIZE = (9, 7)
+INTERP = "nearest"  # avoids washing out thin tributaries
+ACC_VMIN_PCT = 1
+ACC_VMAX_PCT = 99.5
 
-NODATA_VALUE = -9999                     # Change if different (or set None)
-MAX_ELEVATION = None                     # Example: 200 (or None)
-
-SNAP_THRESHOLD = 2000                    # Use a realistic threshold for your DEM
-CHANNEL_THRESHOLD = 500                  # River extraction threshold
-
-XYTYPE = "coordinate"                    # Keep "coordinate" for projected CRS
-
-# =====================================================
-# =====================================================
-
-
-def ensure_folder(path: Path):
-    path.mkdir(parents=True, exist_ok=True)
-
-
-def save_plot(fig, out_path: Path, filename: str):
-    fig.savefig(out_path / filename, dpi=200, bbox_inches="tight")
-    plt.close(fig)
-
-
-def get_pour_point_in_dem_crs(grid: Grid):
-    """
-    Returns (x, y) in DEM CRS.
-    - If POUR_POINT_MODE = "latlon": converts WGS84 lon/lat -> DEM CRS
-    - If "projected": uses POUR_X, POUR_Y directly
-    """
-    if POUR_POINT_MODE.lower() == "projected":
-        return float(POUR_X), float(POUR_Y), "projected input"
-
-    # Lat/Lon input
-    # PySheds stores CRS in grid.crs (often as rasterio CRS or WKT)
-    # We'll robustly convert it using pyproj.CRS
-    dem_crs = CRS.from_user_input(grid.crs)
+# -----------------------------
+# HELPERS
+# -----------------------------
+def get_transformers(grid):
+    """Create transformers between DEM CRS and WGS84 lat/lon."""
+    dem_crs = CRS.from_user_input(grid.crs) if grid.crs else CRS.from_epsg(4326)
     wgs84 = CRS.from_epsg(4326)
+    to_ll = Transformer.from_crs(dem_crs, wgs84, always_xy=True)
+    to_dem = Transformer.from_crs(wgs84, dem_crs, always_xy=True)
+    return dem_crs, to_ll, to_dem
 
-    transformer = Transformer.from_crs(wgs84, dem_crs, always_xy=True)
-    x, y = transformer.transform(float(POUR_LON), float(POUR_LAT))
-    return float(x), float(y), "latlon->DEM CRS transform"
+def finite(arr):
+    a = np.asarray(arr, float)
+    a[~np.isfinite(a)] = 0.0
+    return a
 
-
-def finite_acc(acc):
-    arr = np.array(acc, dtype=float)
-    arr[~np.isfinite(arr)] = 0.0
-    return arr
-
-
-def robust_snap_to_mask(grid: Grid, acc_raster, pour_xy, snap_threshold: float):
+def set_latlon_ticks(ax, grid, nx=5, ny=5):
     """
-    In some pysheds versions, snap_to_mask requires mask to be a Raster.
-    So we build the mask as a Raster using grid.view().
+    Keep data plotted in DEM CRS, but label ticks as Lon/Lat.
+    Works for both projected and geographic DEM.
     """
-    x0, y0 = pour_xy
+    _, to_ll, _ = get_transformers(grid)
+    xmin, ymin, xmax, ymax = grid.bbox
 
-    acc_arr = finite_acc(acc_raster)
-    vmax = float(np.nanmax(acc_arr))
+    xticks = np.linspace(xmin, xmax, nx)
+    yticks = np.linspace(ymin, ymax, ny)
 
-    if vmax <= 0:
-        raise ValueError("Flow accumulation max is <= 0. Check DEM/flowdir.")
+    lon_labels = [to_ll.transform(x, ymin)[0] for x in xticks]
+    lat_labels = [to_ll.transform(xmin, y)[1] for y in yticks]
 
-    # If user threshold too high, reduce automatically
-    thr = float(snap_threshold)
-    if thr >= vmax:
-        thr = max(1.0, 0.25 * vmax)
-        print(f"⚠️ SNAP_THRESHOLD too high for this DEM. Using thr={thr:.2f} instead.")
+    ax.set_xticks(xticks)
+    ax.set_yticks(yticks)
+    ax.set_xticklabels([f"{v:.4f}" for v in lon_labels])
+    ax.set_yticklabels([f"{v:.4f}" for v in lat_labels])
 
-    # Build mask as Raster (not numpy)
-    # grid.view(acc_raster) returns a Raster-like view aligned to grid
-    acc_view = grid.view(acc_raster)
-    mask_raster = acc_view > thr  # this stays as Raster in pysheds
+    ax.set_xlabel("Longitude (°)")
+    ax.set_ylabel("Latitude (°)")
 
-    # If still empty, relax progressively (percentiles)
-    if not np.any(np.asarray(mask_raster)):
-        pos = acc_arr[acc_arr > 0]
-        for q in [99, 98, 97, 95, 90]:
-            t = float(np.percentile(pos, q))
-            mask_raster = acc_view >= t
-            if np.any(np.asarray(mask_raster)):
-                xs, ys = grid.snap_to_mask(mask_raster, (x0, y0))
-                return xs, ys, f"percentile={q} (thr≈{t:.2f})"
-        raise ValueError("Could not find any cells for snapping. Try lowering SNAP_THRESHOLD.")
+def pretty_axes(ax, title):
+    ax.set_title(title, fontsize=14, pad=10)
+    ax.grid(True, alpha=0.25)
 
-    xs, ys = grid.snap_to_mask(mask_raster, (x0, y0))
-    return xs, ys, f"threshold={thr:.2f}"
+def build_stream_mask(grid, acc, method="percentile", percentile=97, area_km2=20):
+    """
+    Stream mask from flow accumulation.
+    - percentile: robust across DEM sizes
+    - area_km2: converts to cells if DEM CRS is projected in meters (UTM etc.)
+    """
+    acc_arr = finite(acc)
+    pos = acc_arr[acc_arr > 0]
+    if pos.size == 0:
+        raise ValueError("Accumulation has no positive values. Check DEM/flowdir.")
 
+    if method == "area_km2":
+        # Only meaningful if DEM CRS is projected (meters). If geographic, fall back to percentile.
+        dem_crs, _, _ = get_transformers(grid)
+        if dem_crs.is_projected:
+            cell = abs(grid.affine.a)  # meters
+            thr = (area_km2 * 1e6) / (cell * cell)
+        else:
+            thr = np.percentile(pos, percentile)
+        note = f"area_km2={area_km2} -> thr≈{thr:.1f} cells" if dem_crs.is_projected else f"percentile={percentile} (geo CRS)"
+    else:
+        thr = np.percentile(pos, percentile)
+        note = f"percentile={percentile} -> thr≈{thr:.1f} cells"
 
-ensure_folder(OUTPUT_FOLDER)
+    mask = grid.view(acc) >= float(thr)
+    return mask, float(thr), note
 
-if not DEM_PATH.exists():
-    raise FileNotFoundError(f"DEM not found: {DEM_PATH}")
+def snap_with_guard(grid, mask, x, y, max_dist_m=3000):
+    """Snap to mask and guard snapping distance."""
+    xs, ys = grid.snap_to_mask(mask, (x, y))
 
-grid = Grid.from_raster(str(DEM_PATH))
-dem = grid.read_raster(str(DEM_PATH)).astype(float)
+    # If CRS is geographic, distance is degrees -> approximate meters using 111km/deg (rough)
+    dem_crs, _, _ = get_transformers(grid)
+    if dem_crs.is_geographic:
+        dx = (xs - x) * 111_000.0 * np.cos(np.deg2rad(y))
+        dy = (ys - y) * 111_000.0
+        dist_m = float(np.hypot(dx, dy))
+    else:
+        dist_m = float(np.hypot(xs - x, ys - y))
 
-# Handle NoData
-if NODATA_VALUE is not None:
-    dem[dem == NODATA_VALUE] = np.nan
-if MAX_ELEVATION is not None:
-    dem[dem > MAX_ELEVATION] = np.nan
+    if dist_m > max_dist_m:
+        raise ValueError(f"Snapped too far ({dist_m:.1f} m). Check outlet location / stream threshold.")
 
-# Pour point conversion / verification
-px, py, mode_note = get_pour_point_in_dem_crs(grid)
+    return xs, ys, dist_m
 
+# -----------------------------
+# MAIN WORKFLOW
+# -----------------------------
+grid = Grid.from_raster(DEM_PATH)
+dem = grid.read_raster(DEM_PATH).astype(float)
+
+dem_crs, to_ll, to_dem = get_transformers(grid)
+print("DEM CRS:", dem_crs)
 print("DEM bbox:", grid.bbox)
-print("Pour point (DEM CRS):", (px, py), f"[{mode_note}]")
-if not (grid.bbox[0] <= px <= grid.bbox[2] and grid.bbox[1] <= py <= grid.bbox[3]):
-    print("⚠️ WARNING: Pour point is outside DEM bbox.")
-    print("   - If using lat/lon, confirm DEM CRS and your coordinates (lat,lon order).")
-    print("   - If using projected, confirm units/meters and EPSG/UTM zone.")
 
-# Plot DEM
-fig, ax = plt.subplots(figsize=(8, 6))
-im = ax.imshow(dem, extent=grid.extent, cmap="terrain")
-fig.colorbar(im, ax=ax, label="Elevation")
-ax.set_title("Digital Elevation Model")
-ax.set_xlabel("X")
-ax.set_ylabel("Y")
-save_plot(fig, OUTPUT_FOLDER, "01_dem.png")
+# ---- Plot DEM (pretty) ----
+fig, ax = plt.subplots(figsize=FIGSIZE)
+im = ax.imshow(dem, extent=grid.extent, cmap="terrain", interpolation=INTERP)
+plt.colorbar(im, ax=ax, label="Elevation (m)")
+pretty_axes(ax, "Digital Elevation Model")
+set_latlon_ticks(ax, grid)
+plt.tight_layout()
+plt.show()
 
-# Hydrological conditioning
+# ---- Hydrologic conditioning ----
 pit_filled = grid.fill_pits(dem)
 flooded = grid.fill_depressions(pit_filled)
 inflated = grid.resolve_flats(flooded)
 
+# ---- Flow direction ----
 dirmap = (64, 128, 1, 2, 4, 8, 16, 32)
 fdir = grid.flowdir(inflated, dirmap=dirmap)
 
-# Flow accumulation
+fig, ax = plt.subplots(figsize=FIGSIZE)
+im = ax.imshow(fdir, extent=grid.extent, cmap="viridis", interpolation=INTERP)
+bounds = ([0] + sorted(list(dirmap)))
+plt.colorbar(im, ax=ax, boundaries=bounds, values=sorted(dirmap), label="D8 direction code")
+pretty_axes(ax, "Flow Direction Grid")
+set_latlon_ticks(ax, grid)
+plt.tight_layout()
+plt.show()
+
+# ---- Accumulation ----
 acc = grid.accumulation(fdir, dirmap=dirmap)
-acc_arr = finite_acc(acc)
-print("acc min/max:", float(np.nanmin(acc_arr)), float(np.nanmax(acc_arr)))
+acc_arr = finite(acc)
+pos = acc_arr[acc_arr > 0]
+vmin = np.percentile(pos, ACC_VMIN_PCT)
+vmax = np.percentile(pos, ACC_VMAX_PCT)
 
-fig, ax = plt.subplots(figsize=(8, 6))
-vmax = float(np.nanmax(acc_arr)) if np.nanmax(acc_arr) > 1 else 2.0
-im = ax.imshow(acc_arr, extent=grid.extent, cmap="cubehelix",
-               norm=colors.LogNorm(1, vmax))
-fig.colorbar(im, ax=ax, label="Upstream Cells")
-ax.set_title("Flow Accumulation")
-ax.set_xlabel("X")
-ax.set_ylabel("Y")
-save_plot(fig, OUTPUT_FOLDER, "02_flow_accumulation.png")
+fig, ax = plt.subplots(figsize=FIGSIZE)
+im = ax.imshow(
+    np.where(acc_arr > 0, acc_arr, np.nan),
+    extent=grid.extent,
+    cmap="cubehelix",
+    norm=colors.LogNorm(vmin, vmax),
+    interpolation=INTERP,
+)
+plt.colorbar(im, ax=ax, label="Upstream cells (log scale)")
+pretty_axes(ax, "Flow Accumulation")
+set_latlon_ticks(ax, grid)
+plt.tight_layout()
+plt.show()
 
-# Snap pour point (Raster mask)
-x_snap, y_snap, snap_note = robust_snap_to_mask(grid, acc, (px, py), SNAP_THRESHOLD)
-print(f"✅ Snapped pour point: ({x_snap:.3f}, {y_snap:.3f}) using {snap_note}")
+# ---- Outlet selection (lat/lon input OR click) ----
+if OUTLET_MODE.lower() == "click":
+    print("Click ONE point on the Accumulation map window, then press Enter...")
+    pt = plt.ginput(1)  # requires interactive backend (qt/widget)
+    x_dem, y_dem = pt[0]
+    lon_pt, lat_pt = to_ll.transform(x_dem, y_dem)
+    print(f"Clicked outlet lat/lon:  {lat_pt:.6f}, {lon_pt:.6f}")
 
-# Catchment
-catch = grid.catchment(x=x_snap, y=y_snap, fdir=fdir, dirmap=dirmap, xytype=XYTYPE)
+    OUTLET_LAT, OUTLET_LON = lat_pt, lon_pt
+
+# Convert lat/lon -> DEM CRS
+x0, y0 = to_dem.transform(float(OUTLET_LON), float(OUTLET_LAT))
+print("Outlet (lat,lon):", OUTLET_LAT, OUTLET_LON)
+print("Outlet in DEM CRS:", x0, y0)
+
+# Check inside bbox
+inside = (grid.bbox[0] <= x0 <= grid.bbox[2]) and (grid.bbox[1] <= y0 <= grid.bbox[3])
+print("Outlet inside DEM bbox:", inside)
+if not inside:
+    raise ValueError("Outlet is outside DEM extent. Use a larger DEM tile or correct coordinates.")
+
+# ---- Stream mask + snapping ----
+stream_mask, thr_used, thr_note = build_stream_mask(
+    grid, acc,
+    method=STREAM_MASK_METHOD,
+    percentile=STREAM_PERCENTILE,
+    area_km2=STREAM_AREA_KM2
+)
+print("Stream mask:", thr_note)
+
+x_snap, y_snap, snap_dist = snap_with_guard(grid, stream_mask, x0, y0, MAX_SNAP_DISTANCE_M)
+lon_snap, lat_snap = to_ll.transform(x_snap, y_snap)
+
+print(f"Snapped outlet distance: {snap_dist:.1f} m")
+print(f"Snapped outlet lat/lon: {lat_snap:.6f}, {lon_snap:.6f}")
+
+# ---- Catchment ----
+catch = grid.catchment(x=x_snap, y=y_snap, fdir=fdir, dirmap=dirmap, xytype="coordinate")
 catch_view = grid.view(catch)
+catch_arr = np.asarray(catch_view)
 
-fig, ax = plt.subplots(figsize=(8, 6))
-ax.imshow(np.where(catch_view, 1, np.nan), extent=grid.extent, cmap="Greys_r")
-ax.plot(px, py, "r*", markersize=10, label="Original")
-ax.plot(x_snap, y_snap, "bo", markersize=6, label="Snapped")
-ax.set_title("Delineated Catchment")
-ax.set_xlabel("X/Longitude")
-ax.set_ylabel("Y/Latitude")
-ax.legend(loc="lower left")
-save_plot(fig, OUTPUT_FOLDER, "03_catchment.png")
+# Extract rivers (vector)
+branches = grid.extract_river_network(fdir, stream_mask, dirmap=dirmap)
 
-# River network
-branches = grid.extract_river_network(fdir, grid.view(acc) > CHANNEL_THRESHOLD, dirmap=dirmap)
+# ---- Beautiful final plot: Catchment + Streams + Outlet ----
+fig, ax = plt.subplots(figsize=(10, 8))
 
-fig, ax = plt.subplots(figsize=(8, 6))
-ax.set_xlim(grid.bbox[0], grid.bbox[2])
-ax.set_ylim(grid.bbox[1], grid.bbox[3])
-ax.set_aspect("equal")
+# Background: hillshade-like contrast from inflated DEM gradient (simple & fast)
+gy, gx = np.gradient(np.nan_to_num(inflated, nan=np.nanmean(inflated)))
+slope = np.hypot(gx, gy)
+shade = 1 - (slope / (np.nanmax(slope) if np.nanmax(slope) > 0 else 1))
+ax.imshow(shade, extent=grid.extent, cmap="gray", alpha=0.85, interpolation=INTERP)
+
+# Catchment overlay
+ax.imshow(np.where(catch_arr, 1, np.nan), extent=grid.extent,
+          cmap="Greys_r", alpha=0.25, interpolation=INTERP)
+
+# Streams as vectors
 for branch in branches["features"]:
     coords = np.asarray(branch["geometry"]["coordinates"])
-    ax.plot(coords[:, 0], coords[:, 1])
-ax.plot(x_snap, y_snap, "ro", markersize=5)
-ax.set_title("Extracted River Network")
-ax.set_xlabel("X/Longitude")
-ax.set_ylabel("Y/Latitude")
-save_plot(fig, OUTPUT_FOLDER, "04_river_network.png")
+    if coords.shape[0] >= 2:
+        ax.plot(coords[:, 0], coords[:, 1], linewidth=1.0)
 
-# Flow distance
-dist = grid.distance_to_outlet(x=x_snap, y=y_snap, fdir=fdir, dirmap=dirmap, xytype=XYTYPE)
-fig, ax = plt.subplots(figsize=(8, 6))
-im = ax.imshow(dist, extent=grid.extent, cmap="cubehelix_r")
-fig.colorbar(im, ax=ax, label="Distance (cells)")
-ax.set_title("Flow Distance to Outlet")
-ax.set_xlabel("X")
-ax.set_ylabel("Y")
-save_plot(fig, OUTPUT_FOLDER, "05_flow_distance.png")
+# Original + snapped outlet
+ax.plot(x0, y0, "r*", ms=12, label=f"Original ({OUTLET_LAT:.4f}, {OUTLET_LON:.4f})")
+ax.plot(x_snap, y_snap, "ko", ms=6, label=f"Snapped ({lat_snap:.4f}, {lon_snap:.4f})")
 
-print("✅ Watershed analysis complete.")
-print("Outputs saved in:", OUTPUT_FOLDER.resolve())
-
+pretty_axes(ax, "Catchment Delineation with Extracted Stream Network")
+set_latlon_ticks(ax, grid)
+ax.legend(loc="lower left", frameon=True)
+plt.tight_layout()
+plt.show()
