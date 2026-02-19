@@ -44,7 +44,7 @@ CLIP_STREAMS_TO_BASIN = True
 # -----------------------------
 # USER SETTINGS
 # -----------------------------
-DEM_PATH = r"E:/QUALITY_1/Terrain/Terrain.ASTGTMV003_N26E083_dem.tif"
+DEM_PATH = r"E:/Ashwin/DEM/AST14DEM_00403102025044241_20251211132210.tif"
 def ensure_outdir(path):
     import os
     os.makedirs(path, exist_ok=True)
@@ -163,8 +163,8 @@ def branches_to_gdf(branches, crs_wkt):
 #   "click"   -> click on accumulation plot; it prints lat/lon and uses that
 OUTLET_MODE = "latlon"   # "latlon" or "click"
 
-OUTLET_LAT = 26.374909
-OUTLET_LON = 83.617662
+OUTLET_LAT = 15.339
+OUTLET_LON = 74.249
 
 # Stream mask method:
 #   "percentile" -> uses STREAM_PERCENTILE of accumulation
@@ -433,6 +433,7 @@ streams_gdf = branches_to_gdf(fine_branches, crs_wkt=str(grid.crs))
 
 # add a representative accumulation value to each line by sampling points along it
 import numpy as np
+import pandas as pd
 strahler = strahler_order_d8(fdir, fine_stream_mask, dirmap)
 
 streams_list = []
