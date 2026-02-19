@@ -33,8 +33,8 @@ import rasterio.features
 
 # --- ADD THESE USER SETTINGS (near USER SETTINGS) ---
 OUT_DIR = r"E:/QUALITY_1/outputs_pysheds"
-BASIN_SHP = f"{OUT_DIR}/basin_f5.shp"
-STREAMS_SHP = f"{OUT_DIR}/streams_f5.shp"
+BASIN_SHP = f"{OUT_DIR}/basin_f15.shp"
+STREAMS_SHP = f"{OUT_DIR}/streams_f15.shp"
 
 # "Fine" streams: lower percentile => denser network (try 90–97)
 FINE_STREAM_PERCENTILE = 93
@@ -683,8 +683,8 @@ outlet_gdf = gpd.GeoDataFrame(
 )
 
 
-OUTLET_SHP = f"{OUT_DIR}/outlet_point.shp"
+OUTLET_SHP = f"{OUT_DIR}/outlet_point2.shp"
 outlet_gdf.to_file(OUTLET_SHP)
 
 outlet_gdf_ll = outlet_gdf.to_crs("EPSG:4326")
-outlet_gdf_ll.to_file(f"{OUT_DIR}/outlet_point_wgs84.shp")
+outlet_gdf_ll.to_file(f"{OUT_DIR}/outlet_point_wgs841.shp")

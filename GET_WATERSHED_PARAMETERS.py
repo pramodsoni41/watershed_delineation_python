@@ -30,14 +30,31 @@ from shapely.geometry import MultiPolygon
 import warnings
 warnings.filterwarnings("ignore")
 
+# --- ADD THESE USER SETTINGS (near USER SETTINGS) ---
+OUT_DIR = r"E:/QUALITY_1/outputs_pysheds"
+BASIN_SHP = f"{OUT_DIR}/basin_f15.shp"
+STREAMS_SHP = f"{OUT_DIR}/streams_f15.shp"
+
+# "Fine" streams: lower percentile => denser network (try 90–97)
+FINE_STREAM_PERCENTILE = 93
+
+# Optional: keep only streams inside basin in output shapefile
+CLIP_STREAMS_TO_BASIN = True
+# -----------------------------
+# USER SETTINGS
+# -----------------------------
+DEM_PATH = r"E:/Ashwin/DEM/AST14DEM_00403102025044241_20251211132210.tif"
+
 # -------------------------
 # USER INPUTS
 # -------------------------
-BASIN_SHP   = r"E:/QUALITY_1/outputs_pysheds/basin.shp"
-STREAMS_SHP = r"E:/QUALITY_1/outputs_pysheds/streams_f7.shp"
+OUT_DIR = r"E:/QUALITY_1/outputs_pysheds"
+BASIN_SHP = f"{OUT_DIR}/basin_f15.shp"
+STREAMS_SHP = f"{OUT_DIR}/streams_f15.shp"
+
 
 # DEM is REQUIRED for relief metrics (Zmax, Zmin, etc.)
-DEM_TIF     = r"E:/QUALITY_1/Terrain/Terrain.ASTGTMV003_N26E083_dem.tif"  # set None to skip relief
+DEM_TIF     = r"E:/Ashwin/DEM/AST14DEM_00403102025044241_20251211132210.tif"  # set None to skip relief
 
 SAVE_CSV    = True
 CSV_OUT     = r"E:/QUALITY_1/outputs_pysheds/morphometry_with_relief.csv"
@@ -211,6 +228,7 @@ def relief_stats_from_dem(dem_path, basin_geom_ll):
     """
     import rasterio
     from rasterio.mask import mask as rio_mask
+    # import pdb; pdb.set_trace()
 
     with rasterio.open(dem_path) as src:
         dem_crs = src.crs
@@ -219,7 +237,7 @@ def relief_stats_from_dem(dem_path, basin_geom_ll):
         basin_in_dem = basin_geom_ll.to_crs(dem_crs)
 
         geoms = [basin_in_dem.geometry.iloc[0]]
-        out, out_transform = rio_mask(src, geoms, crop=True, filled=True)
+        out, out_transform = rio_mask(src, geoms, crop=True, filled=False)
 
         arr = out[0].astype(float)
 
@@ -365,7 +383,7 @@ H_m = Rr = Rhp = Rn = Dis = np.nan
 if DEM_TIF:
     # Basin geometry to GeoDataFrame for reprojection convenience (start from basin layer)
     basin_ll = basin.to_crs("EPSG:4326")
-
+    # import pdb; pdb.set_trace()
     Zmax, Zmin, Zmean, Zmedian, Zstd = relief_stats_from_dem(DEM_TIF, basin_ll)
     H_m = Zmax - Zmin                                  # watershed relief (m)
     Rr  = safe_div(H_m, (Lb_km * 1000.0))              # relief ratio (H/Lb in m/m)
