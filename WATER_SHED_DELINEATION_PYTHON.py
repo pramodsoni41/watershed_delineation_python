@@ -33,8 +33,8 @@ import rasterio.features
 
 # --- ADD THESE USER SETTINGS (near USER SETTINGS) ---
 OUT_DIR = r"E:/QUALITY_1/outputs_pysheds"
-BASIN_SHP = f"{OUT_DIR}/basin_f4.shp"
-STREAMS_SHP = f"{OUT_DIR}/streams_f4.shp"
+BASIN_SHP = f"{OUT_DIR}/basin_f5.shp"
+STREAMS_SHP = f"{OUT_DIR}/streams_f5.shp"
 
 # "Fine" streams: lower percentile => denser network (try 90–97)
 FINE_STREAM_PERCENTILE = 93
