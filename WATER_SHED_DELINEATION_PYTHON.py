@@ -32,10 +32,10 @@ from shapely.ops import unary_union
 import rasterio.features
 
 # --- ADD THESE USER SETTINGS (near USER SETTINGS) ---
-OUT_DIR = r"E:/QUALITY_1/outputs_pysheds"
-BASIN_SHP = f"{OUT_DIR}/basin_f15.shp"
-STREAMS_SHP = f"{OUT_DIR}/streams_f15.shp"
-
+OUT_DIR = r"E:\Suryansh\TEST_DEM"
+BASIN_SHP = f"{OUT_DIR}/basin_2000.shp"
+STREAMS_SHP = f"{OUT_DIR}/streams_2000.shp"
+DEM_PATH = r"E:/Suryansh/TEST_DEM/yearwise/2000.tif"
 # "Fine" streams: lower percentile => denser network (try 90–97)
 FINE_STREAM_PERCENTILE = 93
 
@@ -44,7 +44,7 @@ CLIP_STREAMS_TO_BASIN = True
 # -----------------------------
 # USER SETTINGS
 # -----------------------------
-DEM_PATH = r"E:/Ashwin/DEM/AST14DEM_00403102025044241_20251211132210.tif"
+
 def ensure_outdir(path):
     import os
     os.makedirs(path, exist_ok=True)
