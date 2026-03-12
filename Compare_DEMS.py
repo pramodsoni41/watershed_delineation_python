@@ -28,8 +28,8 @@ from rasterio.mask import mask
 # ---------------------------
 # INPUTS
 # ---------------------------
-folder = r"E:/Suryansh/TEST_DEM/yearwise"
-watershed_path = r"E:/Suryansh/TEST_DEM/watershed.shp"
+folder = r"E:\Suryansh\dems kenjor (2)\dems kenjor\yearwise"
+watershed_path = r"E:/Suryansh/dems kenjor (2)/dems kenjor/Archive/basin_2000.shp"
 
 # Load watershed
 watershed = gpd.read_file(watershed_path)
